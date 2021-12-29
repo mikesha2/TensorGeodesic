@@ -10,7 +10,7 @@ TensorFlow 2.x
 
 numpy
 
-matplotlib.
+matplotlib
 
 
 Tested on TensorFlow 2.7.0, with Apple's tensorflow-metal 0.3.0 plugin.
