@@ -13,7 +13,7 @@ from tensorflow.linalg import diag, inv
 import numpy as np
 from numpy import indices
 #tf.config.set_visible_devices([], 'GPU')
-tf.keras.backend.set_floatx('float64')
+tf.keras.backend.set_floatx('float32')
 #%%
 resolution = 100
 
@@ -65,10 +65,13 @@ def schwarzschildMetric(positions, rs=1):
 @tf.function
 def dMetric(positions, metric=schwarzschildMetric, rs=1):
     with tf.GradientTape() as t:
+        origShape = positions.shape[:-1]
+        batch = (np.prod(origShape), 3)
+        positions = tf.reshape(positions, batch)
         g, g_inv = metric(positions, rs=rs)
-        batch = (np.prod(g.shape[:-2]), 3, 3)
-        dg = t.batch_jacobian(tf.reshape(g, batch), tf.reshape(positions, batch[:-1]))
-        dg = tf.reshape(dg, (*g.shape, 3))
+        dg = t.batch_jacobian(g, positions)
+        g, g_inv = tf.reshape(g, (*origShape, 3, 3)), tf.reshape(g_inv, (*origShape, 3, 3))
+        dg = tf.reshape(dg, (*origShape, 3, 3, 3))
     return g, g_inv, dg
 
 @tf.function
@@ -88,7 +91,7 @@ def geodesicCoeffs(positions, velocities, metric, rs):
 
 # We have to evaluate the Christoffel symbols 4 times at each step
 @tf.function
-def RK4(positions, velocities, metric=schwarzschildMetric, rs=-1, dt=1e-2):
+def RK4(positions, velocities, metric=schwarzschildMetric, rs=-1, dt=5e-1):
     velocities = (velocities / norm(velocities, axis=-1, keepdims=True))
     k11 = dt * velocities
     k21 = dt * geodesicCoeffs(positions, velocities, metric, rs)
@@ -111,42 +114,50 @@ def RK4(positions, velocities, metric=schwarzschildMetric, rs=-1, dt=1e-2):
     return positions, velocities
 
 #%% Assume observer is facing y axis, black hole at origin
-
 # Helper function to perform raycasting so that TensorFlow can compile/optimize the graph
-def raycast(background, positions, velocities, clip, maxIters, resolution, metric, rs):
+def raycast(background, bgInf, positions, velocities, clip, maxIters, resolution, metric, rs):
     result = np.zeros(resolution)
-    terminated = tf.Variable(tf.zeros(resolution, dtype=tf.bool), trainable=False)
+    terminated = tf.Variable(tf.zeros((resolution[0], resolution[1]), dtype=tf.bool), trainable=False)
     
-    limit = 2.5 * rs
+    limit = 1 * rs
     
     for i in range(maxIters):
         print(i)
         if i % 10 == 0:
-
-            numTerminated = tf.reduce_sum(tf.cast(terminated, tf.uint16))
-            print(numTerminated.numpy(), positions[0][0].numpy(), velocities[0][0].numpy())
-            if  numTerminated > 9 * resolution[0] * resolution[1] // 10:
+            numTerminated = tf.reduce_sum(tf.cast(terminated, tf.uint32)).numpy()
+            print(numTerminated, positions[20][20].numpy(), velocities[20][20].numpy())
+            print(999 * resolution[0] * resolution[1] // 1000)
+            if numTerminated > 999 * resolution[0] * resolution[1] // 1000:
                 break
-        for i in range(3):
-            positions, velocities = RK4(positions, velocities, metric=metric, rs=rs)
+        p, velocities = RK4(positions, velocities, metric=metric, rs=rs)
+        positions = tf.Variable(p, trainable=True)
         # Unstable photons are terminated
-        previouslyTerminated = tf.identity(terminated)
-        terminated = (tf.logical_or(tf.logical_or(terminated, (tf.reduce_sum(positions * positions, axis=-1) < limit)), tf.reduce_sum(positions[..., 1]) > 5))
-        result += tf.where(tf.logical_and(tf.logical_not(previouslyTerminated), terminated), background(positions[..., 0], positions[..., 2]), 0)
+        lessThanLimit = tf.reduce_sum(positions * positions, axis=-1) < limit
+        previouslyTerminated = tf.logical_or(tf.identity(terminated), lessThanLimit)
+        yVel = velocities[..., 1]
+        yDist = bgInf - positions[..., 1]
+        t = yDist / yVel
+        linearCastX = positions[..., 0] + velocities[..., 0] * t
+        linearCastZ = positions[..., 2] + velocities[..., 2] * t
+        terminated = tf.logical_or(previouslyTerminated, tf.reduce_sum(positions[..., 1]) > clip)
+        result += tf.where(tf.logical_and(tf.logical_not(previouslyTerminated), terminated)[..., None], background(linearCastX, linearCastZ), 0)
     return result
 
-def runRaycast(background=None, screenDistance=2, blackHoleDistance=1, clip=3, resolution=(1920, 1080), fov=90, maxIters=5000, metric=schwarzschildMetric, rs=1):
-    pixelLength = screenDistance * np.arctan(fov / 2) / (resolution[0] / 2)
+def runRaycast(background=None, xC=1, yC=1, offset=(0, 0), screenDistance=0.1, blackHoleDistance=20, clip=20, bgInf=1000,
+               resolution=(1920, 1080), fov=100, maxIters=5000, metric=schwarzschildMetric, rs=1):
+    pixelLength = screenDistance * np.tan(fov / 2) / (resolution[0] / 2)
     positions = np.zeros((*resolution, 3))
     totalDist = blackHoleDistance + screenDistance
+    positions[..., 0] = offset[0]
     positions[..., 1] = -totalDist
+    positions[..., 2] = offset[1]
     positions = tf.Variable(positions, trainable=True)
     center = (*[i // 2 for i in resolution],)
     
     # Set up initial velocities for raycasting
     velocities = indices(resolution).astype(np.float64)
-    velocities[0, ...] -= center[0]
-    velocities[1, ...] -= center[1]
+    velocities[0, ...] -= center[0] + offset[0]
+    velocities[1, ...] -= center[1] + offset[1]
     velocities *= pixelLength
     velocities = np.stack((velocities[0], screenDistance * np.ones(resolution), velocities[1]), axis=-1)
     velocities /= np.linalg.norm(velocities, axis=-1, keepdims=True)
@@ -154,12 +165,31 @@ def runRaycast(background=None, screenDistance=2, blackHoleDistance=1, clip=3, r
     
     # Set up a background if there is none
     if background is None:
-        background = lambda x,y: tf.exp(-((x-1)*(x-1) + (y+2)*(y+2)) / 2) / 6.283185307179586
+        background = lambda x,y: (tf.exp(-((x-xC)*(x-xC) + (y-yC)*(y-yC)) / 9))[..., None]
+        resolution = (*resolution, 1)
+        #background = lambda x,y: tf.cast((x*x + y*y) < 0.1, tf.float64)
+    else:
+        backgroundPixelLength = (screenDistance + blackHoleDistance + bgInf) / background.shape[0]
+        adjustCenter = (*[i//2 for i in background.shape[:-1]],)
+        bg = tf.convert_to_tensor(background)
+        background = lambda x,y: \
+            tf.gather_nd(bg, tf.stack(
+                (tf.cast(
+                    tf.maximum(tf.minimum(x / backgroundPixelLength + adjustCenter[0], bg.shape[0]-1), 0), tf.int64), 
+                tf.cast(
+                    tf.maximum(tf.minimum(y / backgroundPixelLength + adjustCenter[1], bg.shape[1]-1), 0), tf.int64)),
+            axis=-1))
+        resolution = (*resolution, 3)
 
-    return raycast(background, positions, velocities, clip, maxIters, resolution, metric, rs)
+    return raycast(background, bgInf, positions, velocities, clip, maxIters, resolution, metric, rs)
 
-result = runRaycast()
-
+from matplotlib import image
+background = image.imread('bright.jpeg').transpose(1, 0, 2)
+result = runRaycast(background=background)
+print(result.shape)
+#%%
 import matplotlib.pyplot as plt
-plt.matshow(result)
+#plt.imshow(background.transpose(1, 0, 2))
+fig = plt.matshow(result.numpy().transpose(1, 0, 2))
+plt.savefig('test2.svg')
 
